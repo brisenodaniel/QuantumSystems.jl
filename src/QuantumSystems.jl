@@ -1,3 +1,9 @@
+module QuantumSystems
+
+using LinearAlgebra
+using QuantumToolbox
+using Memoize, LRUCache
+
 abstract type AbstractQuantumSystem end
 const Qsys = AbstractQuantumSystem
 const QuantumSystem = AbstractQuantumSystem
@@ -256,9 +262,10 @@ function _check_idx(lbl::AbstractVector{<:Int}, sys::AbstractQuantumSystem)
         "Number of characters or integers in `lbl` must match number of subsystems in `sys`"
     ))
     idx_checks = map(lbl, tdims) do l_n, t_n
-        l_n ∉ 0:(t_n-1)
+        l_n ∉ 1:t_n
     end
-    return (isempty ∘ findall)(idx_checks) || throw(ArgumentError(
+    bad_idx = findall(idx_checks)
+    return isempty(bad_idx) || throw(ArgumentError(
         "State indices at `lbl` indices $bad_idx lie outside of the range allowed  " *
             "by the Hilbert space dimension of their subsystem "
     ))
@@ -304,7 +311,7 @@ end
 
 function tensor_dims(sys::AbstractQuantumSystem)
     if sys isa SimpleQuantumSystem
-        return collect(sys.H.dims[1])
+        return collect(sys.H.dims)
     else
         return ((tensor_dims(subsys)[1] for subsys in sys.subsys)...,)
     end
@@ -370,7 +377,7 @@ end
 
 function to_energy_basis(
     sys::SimpleQuantumSystem;
-    set_energy_zero::Union{Bool, Float64}=true,
+    set_energy_zero::Union{Bool, Float64}=false,
     etol::Union{Bool, Float64}=false)
     λ, _, U = eigenstates(sys.H)
     U = Qobj(U, dims=sys.H.dims)
@@ -765,3 +772,5 @@ Base.:+(ops::NamedTuple, sys::AbstractQuantumSystem) = sys + ops
 Base.:+(Op::AbstractQuantumObject, sys::AbstractQuantumSystem) = sys + Op
 
 Base.:-(sys::AbstractQuantumSystem, Op::AbstractQuantumObject) = sys +(-1*Op)
+
+end # module QuantumSystems

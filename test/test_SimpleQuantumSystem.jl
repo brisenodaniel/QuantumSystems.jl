@@ -1,7 +1,7 @@
 using Test
 using LinearAlgebra
 using QuantumToolbox
-using XoniumUnitCell
+using QuantumSystems
 
 @testset "SimpleQuantumSystem" begin
 
