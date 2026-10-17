@@ -13,7 +13,7 @@ const _STATE_SYMBOLS = (; g=1, e=2, f=3, h=4) # Julia indexing
 
 export AbstractQuantumSystem, Qsys, QuantumSystem, StateIndex, Maybe
 export SimpleQuantumSystem, CompositeQuantumSystem, Qsys, tensor_dims
-export state, energy, to_energy_basis, truncate_sys, I, state_idx
+export state, energy, to_energy_basis, truncate_sys, I, state_idx, fold_quasienergy
 
 struct SimpleQuantumSystem{
     Ops<:NamedTuple,
@@ -502,6 +502,9 @@ eigenstate of the system Hamiltonian.
 - `sys`: Simple QuantumSystem for which to return the Hamiltonian eigenstate
 - `lbl`: The state label of the desired system eigenstate. Must be a positive integer, a symbol,
          or a vector of Ints of length 1.
+- `bare_to_dressed_tracking`: Either `:overlap` (default) or `:spectrum`. Accepted for API symmetry with
+         `CompositeQuantumSystem` and validated, but otherwise ignored since the eigenstates of a
+         simple system are already energy-ordered.
 
 # Notes:
 - If `lbl` is a positive integer `n`, then the function will return the `nth` eigenstate of the
@@ -514,7 +517,8 @@ eigenstate of the system Hamiltonian.
 # Returns:
 - The eigenstate of `sys.H` corresponding to the state label `lbl`.
  """
-function state(sys::SimpleQuantumSystem, lbl::StateIndex)
+function state(sys::SimpleQuantumSystem, lbl::StateIndex; bare_to_dressed_tracking::Symbol=:overlap)
+    _check_tracking(bare_to_dressed_tracking)
     λ, ψ, _ = eigenstates(sys.H)
     idx = _state_index(lbl, sys)[1]
     return λ[idx], ψ[idx]
@@ -528,8 +532,17 @@ of the system Hamiltonian.
 
 # Arguments
 - `sys`: CompositeQuantumSystem for which to return the Hamiltonian eigenstate.
-- `lbl`: The state label ofthe desired system eigenstate. - `bare`: Boolean flag which sets whether to return the eigenstate in the bare product
+- `lbl`: The state label of the desired system eigenstate.
+- `bare`: Boolean flag which sets whether to return the eigenstate in the bare product
           basis or the dressed eigenbasis of `sys.H`.
+- `bare_to_dressed_tracking`: Keyword, either `:overlap` (default) or `:spectrum`. Only used when
+          `bare==false` and `lbl` is a multi-subsystem label.
+        - `:overlap`: the dressed eigenstate with maximal overlap with the bare product state.
+        - `:spectrum`: the dressed eigenstate whose energy rank equals the energy rank of the
+          bare product state in the bare spectrum (e.g. if `:ge` is the 2nd excited bare state,
+          the 2nd excited eigenstate of `sys.H` is returned). Degenerate bare levels are ordered
+          by label order (first subsystem index varies fastest), so the result is somewhat
+          arbitrary for them; prefer `:overlap` there.
 
 # Notes
 - For a `sys` with `N` subsystems, `lbl` must be a positive integer, a Symbol of `N` characters,
@@ -553,15 +566,28 @@ of the system Hamiltonian.
 # Returns
 - The dressed or bare eigenenergy and eigenstate pair ``(\lambda, \psi)`` of `sys` specified by `lbl`.
 """
-function state(sys::CompositeQuantumSystem, lbl::StateIndex, bare::Bool=false)
+function state(
+    sys::CompositeQuantumSystem,
+    lbl::StateIndex,
+    bare::Bool=false;
+    bare_to_dressed_tracking::Symbol=:overlap,
+)
+    _check_tracking(bare_to_dressed_tracking)
     if bare
         idx = _state_index(lbl, sys)
         return _bare_state(sys, idx)
     else
-        idx = state_idx(sys, lbl)
+        idx = state_idx(sys, lbl; bare_to_dressed_tracking)
         λ, ψ, _ = eigenstates(sys.H)
         return λ[idx], ψ[idx]
     end
+end
+
+function _check_tracking(mode::Symbol)
+    mode in (:overlap, :spectrum) || throw(ArgumentError(
+        "`bare_to_dressed_tracking` must be `:overlap` or `:spectrum`, got `:$mode`"
+    ))
+    return mode
 end
 
 function _bare_state(sys::CompositeQuantumSystem, idx::AbstractVector{<:Int})
@@ -585,10 +611,18 @@ function _bare_state(sys::CompositeQuantumSystem, idx::AbstractVector{<:Int})
     end
 end
 
-function state_idx(sys::CompositeQuantumSystem, lbl::StateIndex, bare::Bool=false)
+function state_idx(
+    sys::CompositeQuantumSystem,
+    lbl::StateIndex,
+    bare::Bool=false;
+    bare_to_dressed_tracking::Symbol=:overlap,
+)
+    _check_tracking(bare_to_dressed_tracking)
     idx = _state_index(lbl, sys)
     if length(idx) == 1
         return idx[1]
+    elseif !bare && bare_to_dressed_tracking == :spectrum
+        return _spectrum_idx(sys, idx)
     elseif !bare && !ismissing(sys.state_lookup[idx...])
         return sys.state_lookup[idx...]
     else
@@ -603,8 +637,106 @@ function state_idx(sys::CompositeQuantumSystem, lbl::StateIndex, bare::Bool=fals
     end
 end
 
-energy(sys::CompositeQuantumSystem, lbl::StateIndex, bare::Bool=false) = state(sys, lbl, bare)[1]
-energy(sys::SimpleQuantumSystem, lbl::StateIndex) = state(sys, lbl)[1]
+# Energy rank of the bare product state `idx` among all bare product states.
+function _spectrum_idx(sys::CompositeQuantumSystem, idx::AbstractVector{<:Int})
+    sub_λ = [real.(first(eigenstates(sub.H))) for sub in sys.subsys]
+    # first subsystem index varies fastest, matching the kron ordering of `tensor`
+    inds = CartesianIndices(Tuple(length.(sub_λ)))
+    energies = [sum(sub_λ[n][I[n]] for n in eachindex(sub_λ)) for I in inds]
+    order = sortperm(vec(energies))  # stable: ties broken by label order
+    target = LinearIndices(inds)[idx...]
+    return findfirst(==(target), order)
+end
+
+energy(sys::CompositeQuantumSystem, lbl::StateIndex, bare::Bool=false; kwargs...) =
+    state(sys, lbl, bare; kwargs...)[1]
+energy(sys::SimpleQuantumSystem, lbl::StateIndex; kwargs...) = state(sys, lbl; kwargs...)[1]
+
+## Floquet states #######################
+
+# Index of the dressed eigenstate of `sys.H` labelled by `lbl`, following the rules of `state`.
+function _dressed_idx(sys::SimpleQuantumSystem, lbl::StateIndex; bare_to_dressed_tracking::Symbol=:overlap)
+    _check_tracking(bare_to_dressed_tracking)
+    return _state_index(lbl, sys)[1]
+end
+
+_dressed_idx(sys::CompositeQuantumSystem, lbl::StateIndex; bare_to_dressed_tracking::Symbol=:overlap) =
+    state_idx(sys, lbl; bare_to_dressed_tracking)
+
+function _check_floquet_compat(sys::AbstractQuantumSystem, fb::FloquetBasis, idx::Int, min_overlap::Maybe{Real})
+    (size(fb.U_T) == size(sys.H) && fb.U_T.dims == sys.H.dims) || throw(ArgumentError(
+        "Dimensions of `fb` $(fb.U_T.dims) do not match those of `sys.H` $(sys.H.dims)"
+    ))
+    isnothing(min_overlap) && return nothing
+    _, ψ, _ = eigenstates(sys)
+    ovlp = abs2(ψ[idx]' * fb.ψfl0[idx])
+    if ovlp < min_overlap
+        @warn "Overlap $(round(ovlp, digits=3)) of Floquet state $idx with the static eigenstate is below " *
+            "`min_overlap = $min_overlap`. Check that `fb` was built with the tracked constructor " *
+            "`FloquetBasis(H0, H_dr, T)` with `H0 = sys.H`, or decrease its `δλ`."
+    end
+    return nothing
+end
+
+@doc raw"""
+    state(sys::QuantumSystem, fb::FloquetBasis, lbl::StateIndex, t::Real=0.0; bare_to_dressed_tracking=:overlap, min_overlap=0.5, cache=false, kwargs...)
+
+Returns the quasienergy and Floquet state at time `t` of `fb` that is adiabatically connected to the
+dressed eigenstate of `sys` labelled by `lbl`.
+
+# Arguments
+- `sys`: QuantumSystem whose Hamiltonian `sys.H` is the static part of the Floquet Hamiltonian.
+- `fb`: FloquetBasis built with the tracked constructor `FloquetBasis(sys.H, H_dr, T)`, so that its
+        `k`-th quasienergy and Floquet state are connected to the `k`-th eigenstate of `sys.H`.
+- `lbl`: State label, interpreted as in `state(sys, lbl)`.
+- `t`: Time at which to return the Floquet state.
+- `bare_to_dressed_tracking`: Either `:overlap` (default) or `:spectrum`, see `state(sys, lbl)`.
+- `min_overlap`: A warning is raised if ``|\langle \lambda_k | \psi_k(0)\rangle|^2`` is below this value,
+        which indicates that `fb` is untracked, built from a different static Hamiltonian, or strongly
+        hybridized by the drive. Set to `nothing` to skip the check.
+- `cache`: If `true`, stores the micromotion propagator at `t` in `fb` (see `propagator!`).
+- `kwargs`: Passed to `propagator`.
+
+# Notes
+- The quasienergy is folded onto the first Brillouin zone ``[-\pi/T, \pi/T)`` (see `fold_quasienergy`),
+  even though `fb.equasi` itself is unfolded onto the branch of the static energy.
+- The Floquet state is ``|\psi_k(t)\rangle = \hat{U}(t, 0)|\psi_k(0)\rangle = e^{-i\epsilon_k t}|u_k(t)\rangle``,
+  not the periodic mode ``|u_k(t)\rangle``. Its global phase is that of the eigenvector of ``\hat{U}(T, 0)``,
+  and is arbitrary.
+
+# Returns
+- The pair ``(\epsilon_k, |\psi_k(t)\rangle)``.
+"""
+function state(
+    sys::AbstractQuantumSystem,
+    fb::FloquetBasis,
+    lbl::StateIndex,
+    t::Real=0.0;
+    bare_to_dressed_tracking::Symbol=:overlap,
+    min_overlap::Maybe{Real}=0.5,
+    cache::Bool=false,
+    kwargs...
+)
+    idx = _dressed_idx(sys, lbl; bare_to_dressed_tracking)
+    _check_floquet_compat(sys, fb, idx, min_overlap)
+    ψ0 = fb.ψfl0[idx]
+    ε = fold_quasienergy(fb.equasi[idx], fb.T)
+    if iszero(t)
+        return ε, ψ0
+    end
+    U = cache ? propagator!(fb, t; kwargs...) : propagator(fb, t; kwargs...)
+    return ε, U * ψ0
+end
+
+"""
+    fold_quasienergy(ε::Real, T::Real)
+
+Fold the quasienergy `ε` of a system driven with period `T` onto ``[-\\pi/T, \\pi/T)``.
+"""
+fold_quasienergy(ε::Real, T::Real) = mod(ε + π / T, 2π / T) - π / T
+
+energy(sys::AbstractQuantumSystem, fb::FloquetBasis, lbl::StateIndex; kwargs...) =
+    state(sys, fb, lbl; kwargs...)[1]
 
 ## Infix Operators #######################
 
